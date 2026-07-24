@@ -35,12 +35,13 @@ use crate::events::{
     VerifierRemoved,
 };
 use crate::storage::{
-    add_credit_to_owner, add_credit_to_project, append_audit_log, consume_nonce,
-    decrement_verifier_pending, get_admin, get_audit_log, get_credit, get_credit_approvals,
-    get_credit_by_project_vintage, get_credits_by_owner, get_credits_by_project, get_issuers,
-    get_methodologies, get_nonce, get_required_approvals, get_retirement_contract, get_session,
-    get_session_op_count, get_verifier_pending_count, get_verifier_reputation, get_verifiers,
-    has_admin, increment_approval_count, increment_dispute_count, increment_session_op_count,
+    add_credit_to_owner, add_credit_to_project, add_to_pending_credits, append_audit_log,
+    consume_nonce, decrement_verifier_pending, get_admin, get_audit_log, get_credit,
+    get_credit_approvals, get_credit_by_project_vintage, get_credits_by_owner,
+    get_credits_by_project, get_issuers, get_methodologies, get_nonce, get_pending_credits,
+    get_required_approvals, get_retirement_contract, get_session, get_session_op_count,
+    get_verifier_pending_count, get_verifier_reputation, get_verifiers, has_admin,
+    increment_approval_count, increment_dispute_count, increment_session_op_count,
     increment_verifier_pending, is_issuer as storage_is_issuer, is_methodology_valid, is_paused,
     is_verifier, remove_credit_approvals, remove_credit_from_owner, set_admin, set_credit,
     set_credit_approvals, set_credit_by_project_vintage, set_issuers, set_methodologies,
@@ -191,10 +192,16 @@ impl CreditRegistry {
         if !is_verifier(&env, &verifier) {
             return Err(CarbonChainError::VerifierNotFound);
         }
-        // Block removal if the verifier still has pending credits assigned to them.
-        let pending = get_verifier_pending_count(&env, &verifier);
-        if pending > 0 {
-            return Err(CarbonChainError::VerifierHasPendingCredits);
+        // Issue #481: block removal only if this verifier is specifically assigned to
+        // one or more credits that are still in Pending status.  We consult the
+        // per-credit CreditVerifiers snapshot (set at submit time) via the global
+        // PendingCredits index instead of the inaccurate global counter.
+        let pending_credits = get_pending_credits(&env);
+        for credit_id in pending_credits.iter() {
+            let assigned = crate::storage::get_credit_verifiers(&env, &credit_id);
+            if assigned.contains(&verifier) {
+                return Err(CarbonChainError::VerifierHasPendingCredits);
+            }
         }
         let old = get_verifiers(&env);
         let mut new_list: Vec<Address> = Vec::new(&env);
@@ -443,13 +450,17 @@ impl CreditRegistry {
         add_credit_to_project(&env, &project_id, &id);
         add_credit_to_owner(&env, &issuer, &id);
 
-        // Issue 1: track pending credits per verifier so remove_verifier can block removal.
-        // We distribute the pending credit across ALL registered verifiers so each one's
-        // count reflects that they may be called upon to approve it.
+        // Issue #481: snapshot the current verifier set for THIS credit so that
+        // remove_verifier can accurately check per-credit assignment rather than
+        // relying on a global over-counting approach.
         let verifiers = get_verifiers(&env);
+        set_credit_verifiers(&env, &id, &verifiers);
         for v in verifiers.iter() {
             increment_verifier_pending(&env, &v);
         }
+        // Track this credit in the global pending list so remove_verifier can
+        // efficiently iterate all pending credits without scanning all storage.
+        add_to_pending_credits(&env, &id);
 
         CreditSubmitted {
             issuer,
@@ -502,11 +513,18 @@ impl CreditRegistry {
             set_credit(&env, &credit_id, &credit);
             remove_credit_approvals(&env, &credit_id);
 
-            // Decrement pending count for all verifiers now that this credit is resolved.
-            let verifiers = get_verifiers(&env);
-            for v in verifiers.iter() {
+            // Issue #481: decrement pending count only for verifiers assigned to THIS
+            // credit (the snapshot taken at submit time), not for all current verifiers.
+            // This prevents over-decrement when new verifiers are added after submission,
+            // and correctly handles verifiers removed mid-flight.
+            let assigned_verifiers = crate::storage::get_credit_verifiers(&env, &credit_id);
+            for v in assigned_verifiers.iter() {
                 decrement_verifier_pending(&env, &v);
             }
+            // Clean up the per-credit snapshot — no longer needed after minting.
+            remove_credit_verifiers(&env, &credit_id);
+            // Remove from pending credits index.
+            remove_from_pending_credits(&env, &credit_id);
 
             CreditMinted {
                 verifier,
@@ -555,12 +573,15 @@ impl CreditRegistry {
         credit.status = CreditStatus::Flagged;
         set_credit(&env, &credit_id, &credit);
         increment_dispute_count(&env, &verifier);
-        // Decrement pending count — this credit is no longer awaiting approval.
+        // Issue #481: decrement pending count using the per-credit snapshot, not the global
+        // verifier list, so removed/added verifiers don't cause under/over counts.
         if was_pending {
-            let verifiers = get_verifiers(&env);
-            for v in verifiers.iter() {
+            let assigned_verifiers = crate::storage::get_credit_verifiers(&env, &credit_id);
+            for v in assigned_verifiers.iter() {
                 decrement_verifier_pending(&env, &v);
             }
+            remove_credit_verifiers(&env, &credit_id);
+            remove_from_pending_credits(&env, &credit_id);
         }
         CreditFlagged {
             id: credit_id,
