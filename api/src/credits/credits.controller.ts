@@ -10,6 +10,8 @@ import {
   DefaultValuePipe,
   ParseIntPipe,
   Request,
+  UsePipes,
+  ValidationPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { CreditsService } from './credits.service';
@@ -24,6 +26,7 @@ import { MergeCreditsDto } from './dto/merge-credits.dto';
 import { CreditMetadata, CreditStatus } from '../../../shared';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PageResult } from './credit.repository';
+import { BulkCreditsDto } from './dto/bulk-credits.dto';
 
 @ApiTags('credits')
 @Controller('credits')
@@ -42,8 +45,9 @@ export class CreditsController {
   @ApiOperation({ summary: 'Bulk fetch credits by IDs' })
   @ApiResponse({ status: 200, description: 'Returns credit metadata array' })
   @Post('bulk')
+  @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false }))
   async getBulkCredits(
-    @Body() dto: { ids: string[] },
+    @Body() dto: BulkCreditsDto,
   ): Promise<CreditMetadata[]> {
     return this.creditsService.getBulkCredits(dto.ids);
   }

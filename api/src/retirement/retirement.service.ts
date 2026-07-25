@@ -74,6 +74,7 @@ export class RetirementService {
     @Inject(CREDIT_REPOSITORY)
     private readonly creditRepo: ICreditRepository,
     @Inject(EVENT_EMITTER) private readonly eventEmitter: IEventEmitter,
+    @Optional() private readonly certificateService?: CertificateService,
   ) {
     this.retirementContractId = this.configService.get<string>(
       'RETIREMENT_CONTRACT_ID',
@@ -204,7 +205,32 @@ export class RetirementService {
     };
     this.eventEmitter.emit('CreditRetired', event);
 
-    return { retirementId, certificateIpfsHash: '' };
+    // ── Step 3: Generate certificate PDF and pin to IPFS (issue #493) ────────
+    // CertificateService is optional so RetirementService remains testable
+    // without it. Pinata failures are gracefully handled inside
+    // generateAndPin() — the retirement succeeds even when IPFS is down.
+    let certificateIpfsHash: string | null = null;
+    if (this.certificateService) {
+      try {
+        const result = await this.certificateService.generateAndPin({
+          retirementId,
+          creditId: dto.creditId,
+          buyer: dto.buyerPublicKey,
+          tonnes: dto.tonnes,
+          reason: dto.reason,
+          timestamp: entity.retiredAt,
+        });
+        certificateIpfsHash = result.ipfsHash;
+      } catch (certErr) {
+        this.logger.warn(
+          `Certificate generation failed for retirement ${retirementId}: ` +
+            `${(certErr as Error).message}`,
+        );
+        // certificateIpfsHash remains null — retirement still succeeds.
+      }
+    }
+
+    return { retirementId, certificateIpfsHash: certificateIpfsHash ?? '' };
   }
 
   /**
