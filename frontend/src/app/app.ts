@@ -8,6 +8,8 @@ import { ThemeService } from './core/services/theme.service';
 import { TranslatePipe } from './core/pipes/translate.pipe';
 import { ToastComponent } from './shared/components/toast.component';
 import { OnlineStatusService } from './core/services/online-status.service';
+import { InstallPromptComponent } from './core/components/install-prompt.component';
+import { PwaInstallService } from './core/services/pwa-install.service';
 
 @Component({
   selector: 'app-root',
@@ -20,6 +22,7 @@ import { OnlineStatusService } from './core/services/online-status.service';
     LocaleSwitcherComponent,
     TranslatePipe,
     ToastComponent,
+    InstallPromptComponent,
   ],
   templateUrl: './app.html',
   styleUrl: './app.css',

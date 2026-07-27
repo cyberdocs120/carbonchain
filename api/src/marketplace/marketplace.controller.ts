@@ -79,6 +79,7 @@ export class MarketplaceController {
   @ApiOperation({ summary: 'Buy an offer from the marketplace' })
   @ApiResponse({ status: 200, description: 'Offer purchased' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 410, description: 'Offer has expired' })
   @UseGuards(JwtAuthGuard)
   @Post('offer/:id/buy')
   buyOffer(
