@@ -10,6 +10,7 @@ import { CacheModule } from './common/cache.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 import { LoggingMiddleware } from './common/logging.middleware';
 import { IdempotencyInterceptor } from './common/idempotency.interceptor';
+import { StructuredExceptionFilter } from './common/filters/structured-exception.filter';
 import { HealthModule } from './health/health.module';
 import { StellarModule } from './stellar/stellar.module';
 import { CreditsModule } from './credits/credits.module';
@@ -74,6 +75,9 @@ import { RequestMetricsMiddleware } from './metrics/request-metrics.middleware';
   providers: [
     AppService,
     { provide: APP_INTERCEPTOR, useClass: IdempotencyInterceptor },
+    // Issue #551: globally handle QueryTimeoutError → 503 and standardise all
+    // error responses so clients receive consistent JSON error bodies.
+    { provide: APP_FILTER, useClass: StructuredExceptionFilter },
   ],
 })
 export class AppModule implements NestModule {

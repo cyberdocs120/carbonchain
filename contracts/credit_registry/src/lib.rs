@@ -211,7 +211,7 @@ impl CreditRegistry {
         // PendingCredits index instead of the inaccurate global counter.
         let pending_credits = get_pending_credits(&env);
         for credit_id in pending_credits.iter() {
-            let assigned = crate::storage::get_credit_verifiers(&env, &credit_id);
+            let assigned = get_credit_verifiers(&env, &credit_id);
             if assigned.contains(&verifier) {
                 return Err(CarbonChainError::VerifierHasPendingCredits);
             }
@@ -727,7 +727,7 @@ impl CreditRegistry {
             // credit (the snapshot taken at submit time), not for all current verifiers.
             // This prevents over-decrement when new verifiers are added after submission,
             // and correctly handles verifiers removed mid-flight.
-            let assigned_verifiers = crate::storage::get_credit_verifiers(&env, &credit_id);
+            let assigned_verifiers = get_credit_verifiers(&env, &credit_id);
             for v in assigned_verifiers.iter() {
                 decrement_verifier_pending(&env, &v);
             }
@@ -786,7 +786,7 @@ impl CreditRegistry {
         // Issue #481: decrement pending count using the per-credit snapshot, not the global
         // verifier list, so removed/added verifiers don't cause under/over counts.
         if was_pending {
-            let assigned_verifiers = crate::storage::get_credit_verifiers(&env, &credit_id);
+            let assigned_verifiers = get_credit_verifiers(&env, &credit_id);
             for v in assigned_verifiers.iter() {
                 decrement_verifier_pending(&env, &v);
             }
@@ -798,6 +798,80 @@ impl CreditRegistry {
             reason,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    // ── Issue #550: Resolve a flagged credit ─────────────────────────────────
+
+    /// Resolve a flagged credit's dispute.
+    ///
+    /// Only the admin or a registered verifier may resolve a flag.  The
+    /// `resolution` parameter determines the outcome:
+    ///
+    /// - [`DisputeResolution::Rejected`] — the flag was a false positive.
+    ///   The credit is restored to [`CreditStatus::Active`] so it can be traded.
+    /// - [`DisputeResolution::Confirmed`] — the anomaly is validated.
+    ///   The credit remains in [`CreditStatus::Flagged`] (blocked from trading).
+    ///
+    /// Consumes **one caller nonce** to prevent replay attacks.
+    ///
+    /// # Errors
+    /// - [`CarbonChainError::NotInitialized`] — contract has not been initialised.
+    /// - [`CarbonChainError::ContractPaused`] — contract is paused.
+    /// - [`CarbonChainError::Unauthorized`] — caller is not the admin or a registered verifier.
+    /// - [`CarbonChainError::InvalidNonce`] — nonce mismatch.
+    /// - [`CarbonChainError::CreditNotFound`] — no credit exists for `credit_id`.
+    /// - [`CarbonChainError::InvalidDisputeStatus`] — credit is not in `Flagged` status.
+    pub fn resolve_flag(
+        env: Env,
+        resolver: Address,
+        credit_id: BytesN<32>,
+        resolution: DisputeResolution,
+        nonce: u64,
+    ) -> Result<(), CarbonChainError> {
+        if is_paused(&env) {
+            return Err(CarbonChainError::ContractPaused);
+        }
+        let stored_admin = get_admin(&env).ok_or(CarbonChainError::NotInitialized)?;
+        resolver.require_auth();
+
+        // Only the admin or a registered verifier may resolve a flag.
+        let is_admin_caller = resolver == stored_admin;
+        let is_verifier_caller = is_verifier(&env, &resolver);
+        if !is_admin_caller && !is_verifier_caller {
+            return Err(CarbonChainError::Unauthorized);
+        }
+
+        if !consume_nonce(&env, &resolver, nonce) {
+            return Err(CarbonChainError::InvalidNonce);
+        }
+
+        let mut credit = get_credit(&env, &credit_id).ok_or(CarbonChainError::CreditNotFound)?;
+
+        // Only credits in Flagged status can be resolved via this function.
+        if credit.status != CreditStatus::Flagged {
+            return Err(CarbonChainError::InvalidDisputeStatus);
+        }
+
+        match resolution {
+            DisputeResolution::Rejected => {
+                // False positive — restore credit to tradeable Active status.
+                credit.status = CreditStatus::Active;
+            }
+            DisputeResolution::Confirmed => {
+                // Anomaly confirmed — credit stays Flagged (no status change).
+            }
+        }
+
+        set_credit(&env, &credit_id, &credit);
+
+        FlagResolved {
+            credit_id,
+            resolver,
+            resolution: resolution as u32,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -1711,6 +1785,126 @@ mod tests {
             &vnonce2,
         );
         assert!(result.is_err());
+    }
+
+    // ── Issue #550: resolve_flag tests ───────────────────────────────────────
+
+    #[test]
+    fn test_resolve_flag_rejected_restores_active() {
+        // Rejected resolution: false-positive flag → credit returns to Active.
+        let (env, client, admin, verifier) = setup();
+        let anonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &anonce);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+
+        // Flag the credit first
+        let vnonce = client.get_nonce(&verifier);
+        client.flag_credit(&verifier, &id, &String::from_str(&env, "anomaly"), &vnonce);
+        assert_eq!(client.get_credit(&id).status, CreditStatus::Flagged);
+
+        // Resolve with Rejected (false positive) — admin resolves
+        let admin_nonce = client.get_nonce(&admin);
+        let result = client.try_resolve_flag(
+            &admin,
+            &id,
+            &crate::types::DisputeResolution::Rejected,
+            &admin_nonce,
+        );
+        assert!(result.is_ok());
+        assert_eq!(client.get_credit(&id).status, CreditStatus::Active);
+    }
+
+    #[test]
+    fn test_resolve_flag_confirmed_stays_flagged() {
+        // Confirmed resolution: anomaly validated → credit stays Flagged.
+        let (env, client, admin, verifier) = setup();
+        let anonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &anonce);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+
+        // Flag the credit
+        let vnonce = client.get_nonce(&verifier);
+        client.flag_credit(&verifier, &id, &String::from_str(&env, "fraud"), &vnonce);
+
+        // Resolve with Confirmed — verifier resolves
+        let vnonce2 = client.get_nonce(&verifier);
+        let result = client.try_resolve_flag(
+            &verifier,
+            &id,
+            &crate::types::DisputeResolution::Confirmed,
+            &vnonce2,
+        );
+        assert!(result.is_ok());
+        // Credit must remain Flagged
+        assert_eq!(client.get_credit(&id).status, CreditStatus::Flagged);
+    }
+
+    #[test]
+    fn test_resolve_flag_non_flagged_credit_fails() {
+        // Attempting to resolve an Active credit returns InvalidDisputeStatus.
+        let (env, client, admin, verifier) = setup();
+        let anonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &anonce);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+        // Credit is still Pending, not Flagged
+        let admin_nonce = client.get_nonce(&admin);
+        let result = client.try_resolve_flag(
+            &admin,
+            &id,
+            &crate::types::DisputeResolution::Rejected,
+            &admin_nonce,
+        );
+        assert_eq!(result, Err(Ok(CarbonChainError::InvalidDisputeStatus)));
+    }
+
+    #[test]
+    fn test_resolve_flag_unauthorized_caller_fails() {
+        // A non-admin, non-verifier address cannot resolve a flag.
+        let (env, client, admin, verifier) = setup();
+        let anonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &anonce);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+
+        let vnonce = client.get_nonce(&verifier);
+        client.flag_credit(&verifier, &id, &String::from_str(&env, "fraud"), &vnonce);
+
+        let rando = Address::generate(&env);
+        let rnonce = client.get_nonce(&rando);
+        let result = client.try_resolve_flag(
+            &rando,
+            &id,
+            &crate::types::DisputeResolution::Rejected,
+            &rnonce,
+        );
+        assert_eq!(result, Err(Ok(CarbonChainError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_resolve_flag_verifier_can_resolve() {
+        // A registered verifier (not only admin) can resolve a flagged credit.
+        let (env, client, admin, verifier) = setup();
+        let anonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &anonce);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &admin, &issuer);
+
+        let vnonce = client.get_nonce(&verifier);
+        client.flag_credit(&verifier, &id, &String::from_str(&env, "suspicious"), &vnonce);
+
+        // Verifier resolves as Rejected
+        let vnonce2 = client.get_nonce(&verifier);
+        let result = client.try_resolve_flag(
+            &verifier,
+            &id,
+            &crate::types::DisputeResolution::Rejected,
+            &vnonce2,
+        );
+        assert!(result.is_ok());
+        assert_eq!(client.get_credit(&id).status, CreditStatus::Active);
     }
 
     #[test]
