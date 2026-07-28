@@ -97,6 +97,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Temporary files
+*.tmp
+*.bak
+*.orig
 # Editor temp files
 *.bak
 *.orig

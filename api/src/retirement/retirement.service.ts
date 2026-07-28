@@ -206,6 +206,8 @@ export class RetirementService {
         ).toString('hex')
       : 'unknown';
 
+    const txHash = (response as rpc.Api.GetTransactionResponse).hash || '';
+
     // ── Step 1: Persist to off-chain index ───────────────────────────────────
     // The record MUST be written before the CreditRetired event is emitted.
     // If this write throws, the event is never emitted and the caller receives
@@ -378,6 +380,28 @@ export class RetirementService {
     }
 
     const rv = (response as unknown as Record<string, unknown>).returnValue;
+    const txHash = (response as rpc.Api.GetTransactionResponse).hash || '';
+    const retirementIds: string[] = rv
+      ? (scValToNative(rv as Parameters<typeof scValToNative>[0]) as Uint8Array[]).map(
+          (b) => Buffer.from(b).toString('hex'),
+        )
+      : [];
+
+    // Persist batch retirement records with the batch transaction hash
+    const now = Math.floor(Date.now() / 1000);
+    for (const retirementId of retirementIds) {
+      const entity = new RetirementEntity();
+      entity.id = retirementId;
+      entity.creditId = '';
+      entity.buyer = dto.buyerPublicKey;
+      entity.tonnesRetired = '';
+      entity.reason = dto.reason;
+      entity.retiredAt = now;
+      entity.txHash = txHash;
+      await this.retirementRepo.save(entity);
+    }
+
+    return { retirementIds, txHash };
 
     // The contract now returns BatchRetireResult { succeeded: Vec<BytesN<32>>, failed: Vec<{credit_id, error_code}> }
     let succeededIds: string[] = [];
