@@ -61,6 +61,8 @@ browser_test_results/
 # Vitest / Jest cache
 .vitest-cache/
 .jest-cache/
+# Jest stale file
+.jest_cache/
 # Jest coverage directory
 jest-coverage/
 # Jasmine test output

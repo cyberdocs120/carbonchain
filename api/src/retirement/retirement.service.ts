@@ -15,6 +15,8 @@ import { CreditStatus, RetirementRecord } from '../../../shared';
 import { RetirementEntity } from './retirement.entity';
 import type { IRetirementRepository } from './retirement.repository';
 import { RETIREMENT_REPOSITORY } from './retirement.repository';
+import { PageResult } from '../credits/credit.repository';
+import { NonceService } from '../common/nonce.service';
 import type { ICreditRepository } from '../credits/credit.repository';
 import { CREDIT_REPOSITORY, PageResult } from '../credits/credit.repository';
 import { RetireDto, FullRetireDto } from './dto/retire.dto';
@@ -22,6 +24,20 @@ import { BatchRetireDto } from './dto/batch-retire.dto';
 
 export const MAX_BATCH_SIZE = 10;
 
+export class RetireDto {
+  buyerPublicKey: string;
+  creditId: string;
+  tonnes: string;
+  reason: string;
+  /** Optional nonce for API-layer replay-attack deduplication (#415). */
+  nonce?: string;
+}
+
+export class BatchRetireDto {
+  buyerPublicKey: string;
+  creditIds: string[];
+  tonnes: string[];
+  reason: string;
 export interface BatchRetireResult {
   succeeded: string[];
   failed: { id: string; reason: string }[];
@@ -76,6 +92,7 @@ export class RetirementService {
     @Inject(CREDIT_REPOSITORY)
     private readonly creditRepo: ICreditRepository,
     @Inject(EVENT_EMITTER) private readonly eventEmitter: IEventEmitter,
+    private readonly nonceService?: NonceService,
     @Optional() private readonly certificateService?: CertificateService,
   ) {
     this.retirementContractId = this.configService.get<string>(
@@ -142,6 +159,13 @@ export class RetirementService {
     this.logger.log(
       `Retiring credit ${dto.creditId} for ${dto.buyerPublicKey}`,
     );
+
+    // ── #415: API-layer nonce deduplication ───────────────────────────────────
+    // Claim the nonce in Redis before submitting the transaction on-chain.
+    // A duplicate nonce within the Stellar ledger close window returns 409.
+    if (dto.nonce !== undefined && this.nonceService) {
+      await this.nonceService.consumeNonce(dto.buyerPublicKey, dto.nonce);
+    }
 
     const args = [
       nativeToScVal(dto.buyerPublicKey, { type: 'address' }),
